@@ -1,0 +1,8 @@
+create phone scan to find local models on phone, create skills for local model to control app through agent, 
+Because the GitHub API returned 404s on write operations (likely read-only token access), you need to manually paste Settings.tsx and App.tsx from my earlier response. These files:
+
+Settings.tsx: Uses db.apiConfigs and db.settings (not localStorage)
+
+App.tsx: Adds error boundaries, PIN gate, passes onNavigate to Dashboard
+
+Then add a PWA manifest to public/manifest.json and register a service worker for offline support and home-screen installation.
