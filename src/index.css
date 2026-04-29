@@ -1,0 +1,40 @@
+@import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Outfit:wght@300;400;600;700&display=swap');
+
+@theme {
+  --font-sans: "Outfit", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  
+  --color-brand-primary: #FF6B00; /* Neon Orange for "Edge" emphasis */
+  --color-brand-secondary: #00FF94; /* Profit Green */
+  --color-brand-error: #FF3D3D; /* Loss Red */
+  --color-bg-main: #0B0C0E;
+  --color-bg-card: #15171A;
+  --color-bg-surface: #1C1F24;
+}
+
+body {
+  @apply bg-bg-main text-white antialiased font-sans;
+  background-image: 
+    radial-gradient(circle at 50% 0%, rgba(255, 107, 0, 0.05) 0%, transparent 50%),
+    radial-gradient(circle at 100% 100%, rgba(0, 255, 148, 0.02) 0%, transparent 40%);
+  min-height: 100vh;
+}
+
+.glass-panel {
+  @apply bg-bg-card/80 backdrop-blur-md border border-white/5 rounded-2xl shadow-2xl;
+}
+
+.bet-card-gradient {
+  background: linear-gradient(135deg, rgba(255,255,255,0.03) 0%, rgba(255,255,255,0) 100%);
+}
+
+.animate-pulse-slow {
+  animation: pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.8; }
+}
+

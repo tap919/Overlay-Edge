@@ -1,0 +1,8 @@
+{
+  "name": "Overlay Edge",
+  "description": "Professional sports betting analytics and strategy tracker for serious bettors. Log bets with screenshots, use custom formulas (EV, Kelly), and monitor your edge across NBA, NFL, MLB, and WNBA.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": []
+}
