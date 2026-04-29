@@ -5,6 +5,8 @@ export enum Sport {
   NFL = 'NFL',
   MLB = 'MLB',
   WNBA = 'WNBA',
+  NCAAB = 'NCAAB',
+  NHL = 'NHL',
 }
 
 export enum BetType {
@@ -32,7 +34,7 @@ export interface Strategy {
   id?: number;
   name: string;
   description: string;
-  formula?: string; 
+  formula?: string;
   isActive: boolean;
   createdAt: number;
 }
@@ -43,7 +45,7 @@ export interface Bet {
   league: string;
   teams: string[];
   betType: BetType;
-  odds: number; 
+  odds: number;
   stake: number;
   bookmaker: string;
   strategyId: number;
@@ -51,21 +53,25 @@ export interface Bet {
   resultProfit?: number;
   timestamp: number;
   gameDate: number;
-  gameTime?: string; // For circadian rhythm (e.g. "19:00")
-  timezone?: string; // For circadian rhythm (e.g. "EST")
-  daysRest?: number; // Travel/Rest context
+  gameTime?: string;
+  timezone?: string;
+  daysRest?: number;
   isParlay?: boolean;
   legs?: ParlayLeg[];
+  tags?: string[];
   parsedDataRaw?: string;
 }
 
 export interface WatchedStat {
   id?: number;
-  name: string; // "LeBron James Points" or "Lakers Rebounds"
+  name: string;
   category: 'PLAYER' | 'TEAM';
   sport: Sport;
   targetValue: number;
   trendDirection: 'OVER' | 'UNDER';
+  currentValue?: number;
+  lastUpdated?: number;
+  notes?: string;
 }
 
 export interface Dataset {
@@ -74,7 +80,16 @@ export interface Dataset {
   source: string;
   rowCount: number;
   lastSync: number;
-  data: any[]; // Historical lines
+  data: any[];
+}
+
+export interface ApiConfig {
+  id?: number;
+  label: string;
+  key: string;
+  endpoint?: string;
+  status: 'active' | 'error' | 'pending';
+  addedAt: number;
 }
 
 export interface UserSettings {
@@ -82,13 +97,18 @@ export interface UserSettings {
   bankroll: number;
   currency: string;
   theOddsApiKey?: string;
-  syncFrequency: number; // times per day
+  syncFrequency: number;
   lastSync?: number;
-  apiConfigs: Array<{
-    name: string;
-    endpoint: string;
-    apiKey: string;
-  }>;
+  pin?: string; // bcrypt-style hash stored client-side
+  accentColor?: string;
+  hudOpacity?: number;
+  animationsEnabled?: boolean;
+  glowEffects?: boolean;
+  compactMode?: boolean;
+  fontSize?: 'xs' | 'sm' | 'base';
+  dashboardLayout?: 'grid' | 'list';
+  modelPriority?: string;
+  edgeSensitivity?: number;
 }
 
 export interface LiveMarket {
@@ -109,33 +129,33 @@ export class AppDatabase extends Dexie {
   watchedStats!: Table<WatchedStat>;
   datasets!: Table<Dataset>;
   liveMarkets!: Table<LiveMarket>;
+  apiConfigs!: Table<ApiConfig>;
 
   constructor() {
     super('OverlayEdgeDB');
-    this.version(3).stores({
+    this.version(4).stores({
       bets: '++id, sport, strategyId, status, timestamp, gameDate, isParlay',
       strategies: '++id, name, isActive',
       settings: 'id',
-      watchedStats: '++id, name, sport',
+      watchedStats: '++id, name, sport, category',
       datasets: '++id, name',
-      liveMarkets: '++id, gameId, sport, commenceTime'
+      liveMarkets: '++id, gameId, sport, commenceTime',
+      apiConfigs: '++id, label, status',
     });
   }
 }
 
 export const db = new AppDatabase();
 
-// Seed initial strategies if none exist
 export async function seedData() {
   const strategyCount = await db.strategies.count();
   if (strategyCount === 0) {
     await db.strategies.bulkAdd([
       { name: 'NBA Prop Model v1', description: 'Focuses on player rebounds/assists overlays.', isActive: true, createdAt: Date.now() },
       { name: 'NFL Totals System', description: 'Unders on prime time games logic.', isActive: true, createdAt: Date.now() },
-      { name: 'MLB Home Dog Strategy', description: 'Betting home favorites with specific pitcher matchups.', isActive: true, createdAt: Date.now() }
+      { name: 'MLB Home Dog Strategy', description: 'Betting home favorites with specific pitcher matchups.', isActive: true, createdAt: Date.now() },
     ]);
   }
-
   const settingsCount = await db.settings.count();
   if (settingsCount === 0) {
     await db.settings.add({
@@ -143,7 +163,15 @@ export async function seedData() {
       bankroll: 1000,
       currency: 'USD',
       syncFrequency: 4,
-      apiConfigs: []
+      accentColor: '#FF6B00',
+      hudOpacity: 90,
+      animationsEnabled: true,
+      glowEffects: true,
+      compactMode: false,
+      fontSize: 'sm',
+      dashboardLayout: 'grid',
+      modelPriority: 'DEEPSEEK',
+      edgeSensitivity: 85,
     });
   }
 }
