@@ -1,0 +1,267 @@
+import { db } from '../db/db';
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+export type EdgeGrade = 'S' | 'A' | 'B' | 'C';
+
+export interface EdgeOpportunity {
+  id: string;
+  gameId: string;
+  homeTeam: string;
+  awayTeam: string;
+  sport: string;
+  commenceTime: number;
+  /** The team or player side to back */
+  selection: string;
+  bookmaker: string;
+  marketKey: 'h2h' | 'spreads' | 'totals';
+  odds: number;
+  /** Raw implied probability from book (includes vig) */
+  impliedProb: number;
+  /** Consensus no-vig probability across all books */
+  noVigProb: number;
+  /** EV as decimal, e.g. 0.05 = 5% edge */
+  ev: number;
+  /** Quarter-Kelly fraction of bankroll */
+  kellyPct: number;
+  /** Recommended $ stake */
+  kellyStake: number;
+  grade: EdgeGrade;
+  /** Number of books offering this market */
+  bookCount: number;
+  /** Best available odds across all books for this selection */
+  bestOdds: number;
+  bestOddsBook: string;
+}
+
+export interface ArbitrageOpportunity {
+  gameId: string;
+  homeTeam: string;
+  awayTeam: string;
+  legs: ArbitrageLeg[];
+  /** Expected ROI % on a balanced stake */
+  roi: number;
+  /** Sum of implied probs (< 1.0 means arb exists) */
+  sumImplied: number;
+}
+
+export interface ArbitrageLeg {
+  bookmaker: string;
+  selection: string;
+  odds: number;
+  /** Fraction of total stake to allocate to this leg */
+  stakePct: number;
+}
+
+export interface ScanResult {
+  scannedAt: number;
+  marketsScanned: number;
+  bookmakersCovered: number;
+  edgeOpportunities: EdgeOpportunity[];
+  arbitrageOpportunities: ArbitrageOpportunity[];
+  topEdge: EdgeOpportunity | null;
+  topArb: ArbitrageOpportunity | null;
+  summary: string;
+}
+
+// ─── Math Helpers ─────────────────────────────────────────────────────────────
+
+function toImplied(decimalOdds: number): number {
+  return decimalOdds > 1 ? 1 / decimalOdds : 0;
+}
+
+/**
+ * Remove vig from N outcomes using additive normalization.
+ * Returns true (no-vig) probabilities that sum to 1.
+ */
+function noVigProbs(impliedProbs: number[]): number[] {
+  const total = impliedProbs.reduce((a, b) => a + b, 0);
+  if (total <= 0) return impliedProbs.map(() => 1 / impliedProbs.length);
+  return impliedProbs.map(p => p / total);
+}
+
+/**
+ * Quarter-Kelly fraction: f* = (b·p − q) / b × 0.25
+ * Returns 0 if negative edge.
+ */
+function quarterKelly(prob: number, decimalOdds: number): number {
+  const b = decimalOdds - 1;
+  if (b <= 0) return 0;
+  const q = 1 - prob;
+  const full = (b * prob - q) / b;
+  return Math.max(0, full * 0.25);
+}
+
+function gradeEdge(ev: number): EdgeGrade {
+  if (ev >= 0.08) return 'S';
+  if (ev >= 0.05) return 'A';
+  if (ev >= 0.03) return 'B';
+  return 'C';
+}
+
+// ─── Core Scanner ─────────────────────────────────────────────────────────────
+
+export async function scanForEdge(bankroll: number): Promise<ScanResult> {
+  const markets = await db.liveMarkets.toArray();
+  const opportunities: EdgeOpportunity[] = [];
+  const arbitrage: ArbitrageOpportunity[] = [];
+  const bookmakerSet = new Set<string>();
+
+  for (const market of markets) {
+    if (!market.bookmakers?.length) continue;
+
+    // ── Collect H2H odds across all books ─────────────────────────────────
+    // Structure: selectionName → [{bookmaker, odds}]
+    const h2hBySelection = new Map<string, Array<{ bookmaker: string; odds: number }>>();
+    let totalBookCount = 0;
+
+    for (const book of market.bookmakers) {
+      const h2hMkt = book.markets?.find((m: any) => m.key === 'h2h');
+      if (!h2hMkt?.outcomes?.length) continue;
+      totalBookCount++;
+      bookmakerSet.add(book.title);
+
+      for (const outcome of h2hMkt.outcomes) {
+        if (!outcome?.name || !outcome?.price) continue;
+        const key = outcome.name as string;
+        if (!h2hBySelection.has(key)) h2hBySelection.set(key, []);
+        h2hBySelection.get(key)!.push({ bookmaker: book.title, odds: Number(outcome.price) });
+      }
+    }
+
+    const selections = Array.from(h2hBySelection.keys());
+    if (selections.length < 2 || totalBookCount < 2) continue; // Need multi-book for consensus
+
+    // ── Consensus no-vig probabilities (average implied across all books) ──
+    const avgImplied = selections.map(sel => {
+      const entries = h2hBySelection.get(sel)!;
+      const meanOdds = entries.reduce((s, e) => s + e.odds, 0) / entries.length;
+      return toImplied(meanOdds);
+    });
+    const noVig = noVigProbs(avgImplied);
+
+    // ── Best odds per selection (find line shopping edge) ─────────────────
+    const bestBySelection = new Map<string, { bookmaker: string; odds: number }>();
+    for (const sel of selections) {
+      const best = h2hBySelection.get(sel)!.reduce((a, b) => a.odds > b.odds ? a : b);
+      bestBySelection.set(sel, best);
+    }
+
+    // ── EV calculation ─────────────────────────────────────────────────────
+    selections.forEach((sel, idx) => {
+      const nvProb = noVig[idx];
+      const best = bestBySelection.get(sel)!;
+      const bookOdds = best.odds;
+      const ev = nvProb * (bookOdds - 1) - (1 - nvProb);
+
+      if (ev >= 0.02) {
+        const kelly = quarterKelly(nvProb, bookOdds);
+        opportunities.push({
+          id: `${market.gameId}::${sel}`,
+          gameId: market.gameId,
+          homeTeam: market.homeTeam,
+          awayTeam: market.awayTeam,
+          sport: market.sport,
+          commenceTime: market.commenceTime,
+          selection: sel,
+          bookmaker: best.bookmaker,
+          marketKey: 'h2h',
+          odds: bookOdds,
+          impliedProb: toImplied(bookOdds),
+          noVigProb: nvProb,
+          ev,
+          kellyPct: kelly,
+          kellyStake: bankroll * kelly,
+          grade: gradeEdge(ev),
+          bookCount: totalBookCount,
+          bestOdds: bookOdds,
+          bestOddsBook: best.bookmaker,
+        });
+      }
+    });
+
+    // ── Arbitrage detection ────────────────────────────────────────────────
+    // True arb: sum of (1/bestOdds) < 1 across selections
+    const bestImpliedSum = selections.reduce((sum, sel) => {
+      return sum + toImplied(bestBySelection.get(sel)!.odds);
+    }, 0);
+
+    if (bestImpliedSum < 0.995) { // 0.5% margin for fees
+      const roi = (1 / bestImpliedSum - 1) * 100;
+      const legs: ArbitrageLeg[] = selections.map(sel => {
+        const best = bestBySelection.get(sel)!;
+        return {
+          bookmaker: best.bookmaker,
+          selection: sel,
+          odds: best.odds,
+          stakePct: toImplied(best.odds) / bestImpliedSum, // proportional allocation
+        };
+      });
+      arbitrage.push({
+        gameId: market.gameId,
+        homeTeam: market.homeTeam,
+        awayTeam: market.awayTeam,
+        legs,
+        roi,
+        sumImplied: bestImpliedSum,
+      });
+    }
+  }
+
+  // Sort opportunities by EV desc
+  opportunities.sort((a, b) => b.ev - a.ev);
+  arbitrage.sort((a, b) => b.roi - a.roi);
+
+  const topEdge = opportunities[0] ?? null;
+  const topArb = arbitrage[0] ?? null;
+
+  // Build human-readable summary
+  let summary = `Scanned ${markets.length} markets across ${bookmakerSet.size} books. `;
+  if (opportunities.length > 0) {
+    summary += `Found ${opportunities.length} EV+ opportunities. `;
+    summary += `Top: ${topEdge!.selection} @${topEdge!.odds.toFixed(2)} via ${topEdge!.bookmaker} — ${(topEdge!.ev * 100).toFixed(1)}% EV (${topEdge!.grade}-grade). `;
+    summary += `Recommended stake: $${topEdge!.kellyStake.toFixed(2)} (${(topEdge!.kellyPct * 100).toFixed(2)}% Kelly). `;
+  } else {
+    summary += 'No EV+ opportunities found (>2% threshold). ';
+  }
+  if (arbitrage.length > 0) {
+    summary += `${arbitrage.length} arbitrage opportunity detected — ${topArb!.roi.toFixed(2)}% ROI on ${topArb!.homeTeam} vs ${topArb!.awayTeam}.`;
+  }
+
+  return {
+    scannedAt: Date.now(),
+    marketsScanned: markets.length,
+    bookmakersCovered: bookmakerSet.size,
+    edgeOpportunities: opportunities.slice(0, 25),
+    arbitrageOpportunities: arbitrage,
+    topEdge,
+    topArb,
+    summary,
+  };
+}
+
+/** Quick EV check for a single bet — used by Kelly calculator */
+export function computeEV(decimalOdds: number, winProbability: number): number {
+  const b = decimalOdds - 1;
+  return winProbability * b - (1 - winProbability);
+}
+
+/** Full Kelly breakdown for display */
+export function kellyBreakdown(winProb: number, decimalOdds: number, bankroll: number) {
+  const b = decimalOdds - 1;
+  const q = 1 - winProb;
+  const fullKelly = Math.max(0, (b * winProb - q) / b);
+  const halfKelly = fullKelly * 0.5;
+  const quarterKellyVal = fullKelly * 0.25;
+  const ev = computeEV(decimalOdds, winProb);
+  return {
+    ev,
+    fullKelly,
+    halfKelly,
+    quarterKelly: quarterKellyVal,
+    fullStake: bankroll * fullKelly,
+    halfStake: bankroll * halfKelly,
+    quarterStake: bankroll * quarterKellyVal,
+    isPositiveEV: ev > 0,
+  };
+}
