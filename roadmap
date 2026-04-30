@@ -1,0 +1,65 @@
+Here is a complete, unfiltered honest assessment of [Overlay-Edge](https://github.com/tap919/Overlay-Edge) along with a prioritized roadmap to make it elite.
+
+***
+
+## What It Actually Is
+
+Overlay-Edge is a React/TypeScript sports betting edge-finding tool with a built-in AI agent ("Neural Bridge") powered by DeepSeek R1's tool-calling API . It fetches live odds from The Odds API, computes EV+, arbitrage, and Kelly stakes, and includes a headless browser component for real-time odds verification . The architecture is surprisingly clean for a solo project — separate service files for odds, scanning, and agent tools, backed by Dexie (IndexedDB) for local persistence .
+
+***
+
+## Honest Strengths
+
+- **Solid math foundation** — additive vig removal, quarter-Kelly staking, and proper decimal EV calculation (`nvProb × (odds − 1) − (1 − nvProb)`) are all correctly implemented 
+- **ReAct agent loop** — up to 10 tool-call turns with DeepSeek R1, properly sequencing `sync_odds → scan_edge → final answer` 
+- **Grade system** — S/A/B/C tiering based on EV thresholds (8%/5%/3%/2%) gives users an actionable signal hierarchy 
+- **Autonomous mode** — configurable interval auto-scan that fires alerts when a grade-A+ opportunity appears, which is genuinely useful 
+- **Arbitrage detection** — correctly calculates `sumImplied < 0.995` with proportional leg allocation 
+- **Dual AI engine** — fallback to `window.ai` Gemma Nano for offline/local operation is a smart forward-looking feature 
+
+***
+
+## Honest Weaknesses
+
+These are the real blockers between "interesting project" and "best in the business":
+
+- **H2H only, NBA only** — The edge scanner only processes `marketKey: 'h2h'` even though the type definitions include `spreads` and `totals`; `runManualScan` and `runAutoCycle` both hardcode `'basketball_nba'` 
+- **Weak consensus model** — True probability is derived by averaging implied odds across sportsbooks, which means sharp books like Pinnacle carry the same weight as recreational books like DraftKings — this inflates perceived edge
+- **No CLV tracking** — Closing Line Value is the industry gold standard for proving real edge. Without it, you can't distinguish skill from luck 
+- **Unbounded API history** — `apiHistory` grows forever in state, which will hit DeepSeek's token limit in long sessions and cause silent failures 
+- **No persistent bet log or P&L** — `get_bet_history` is referenced in the system prompt but there's no bet-logging UI; tracking results is the only way to validate the tool's edge claims 
+- **No alert delivery** — Opportunities only appear in-app; no SMS, push, or email means you have to be staring at the screen
+- **Browser scraping is fragile** — Sportsbooks actively detect and block headless Chromium; this will break without stealth libraries
+- **No tests** — Zero test files visible in the repository 
+- **File naming** — Core files (`agent`, `agentttools`, `edgescanner`, `settings`) have no extensions, which breaks editor tooling and `agentttools` has a typo 
+
+***
+
+## Roadmap to Best in Business
+
+### Phase 1 — Fix the Foundation (Weeks 1–2)
+1. **Fix the H2H-only scanner** — Add `spreads` and `totals` market processing in `scanForEdge()`; the data structure already supports it
+2. **Parameterize sport** — Replace the hardcoded `'basketball_nba'` string with a user-configurable sport list so the auto-cycle covers NFL, MLB, NHL, soccer, etc.
+3. **Cap and prune API history** — Implement a sliding window (last 20 messages) to prevent token limit crashes in long sessions
+4. **Fix the file naming** — Rename `agent` → `Agent.tsx`, `agentttools` → `agentTools.ts`, `edgescanner` → `edgeScanner.ts` for proper tooling support
+
+### Phase 2 — Sharpen the Math (Weeks 3–4)
+5. **Use Pinnacle as the sharp-book benchmark** — Weight Pinnacle's odds 3–5× more heavily in the consensus probability calculation; they are the most accurate book in the world and this is how professional +EV bettors actually find edge
+6. **Switch to multiplicative/power vig removal** — More accurate than additive normalization, especially for markets with large vig spreads
+7. **Add Half-Kelly and Full-Kelly options** — Quarter-Kelly is conservative and correct for beginners, but serious bettors want control over their staking fraction
+
+### Phase 3 — Track and Prove Edge (Weeks 5–6)
+8. **Build a full bet logger** — Log every recommended bet with timestamp, odds, EV%, and whether it won; store to Dexie
+9. **Add CLV tracking** — Record the odds at bet placement AND the closing line odds; display CLV per bet and aggregate. This is the single most important feature for validating the tool
+10. **Build a P&L dashboard** — ROI by sport, market type, bookmaker, and grade tier
+
+### Phase 4 — Real-Time Intelligence (Weeks 7–8)
+11. **Add line movement detection** — Poll odds every 2 minutes and flag when a line moves ≥0.5 points; steam moves (sharp money) are high-signal
+12. **Add a Pinnacle API integration** — Their odds API or a scraper gives you the sharpest market in the world as a reference
+13. **Add push notifications** — Use Web Push or integrate with a service like Pushover or Ntfy for real S-grade alerts when you're not at the screen
+
+### Phase 5 — Production Hardening (Weeks 9–10)
+14. **Add Playwright stealth mode** — Replace bare Chromium with `playwright-extra` + `puppeteer-extra-plugin-stealth` to avoid sportsbook bot detection
+15. **Write unit tests** — At minimum, test `scanForEdge()`, `noVigProbs()`, `quarterKelly()`, and the EV formula with known inputs
+16. **Add a Docker Compose setup** — So the whole stack (Node server + browser agent) can be deployed in one command
+17. **Add multi-sport scheduled scanning** — A cron job that cycles through all active sports and pushes results to a notification channel without requiring the UI to be open
