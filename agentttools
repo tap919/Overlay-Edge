@@ -1,0 +1,344 @@
+/**
+ * agentTools.ts
+ * Maps DeepSeek tool_call names → real implementations.
+ * All browser calls go to Express server endpoints.
+ * All data calls go directly to Dexie.
+ */
+
+import { db, BetStatus } from '../db/db';
+import { scanForEdge, kellyBreakdown, computeEV } from './edgeScanner';
+import { syncLiveOdds } from './oddsService';
+
+// ─── Tool Result Type ─────────────────────────────────────────────────────────
+
+export interface ToolResult {
+  ok: boolean;
+  data?: any;
+  error?: string;
+  /** Optional base64 screenshot to display in UI */
+  screenshot?: string;
+  /** Optional URL that was navigated to */
+  browserUrl?: string;
+}
+
+// ─── Tool Definitions (OpenAI-compatible format for DeepSeek) ─────────────────
+
+export const AGENT_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'sync_odds',
+      description:
+        'Fetch the latest live sports odds from The Odds API and persist them locally. Always call this before scan_edge to ensure fresh data.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sport: {
+            type: 'string',
+            enum: [
+              'basketball_nba',
+              'americanfootball_nfl',
+              'baseball_mlb',
+              'icehockey_nhl',
+              'basketball_wnba',
+              'basketball_ncaab',
+            ],
+            description: 'Sport key to sync',
+          },
+        },
+        required: ['sport'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'scan_edge',
+      description:
+        'Analyze all stored live markets for EV+ opportunities, arbitrage, and Kelly-sized stake recommendations. Returns ranked results.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'calculate_kelly',
+      description: 'Compute Kelly Criterion breakdown (full, half, quarter) for a specific bet.',
+      parameters: {
+        type: 'object',
+        properties: {
+          odds: { type: 'number', description: 'Decimal odds (e.g. 2.10)' },
+          win_probability: {
+            type: 'number',
+            description: 'Your estimated win probability as a decimal (e.g. 0.55 for 55%)',
+          },
+        },
+        required: ['odds', 'win_probability'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_bet_history',
+      description: 'Retrieve recent bets from the local database with performance stats.',
+      parameters: {
+        type: 'object',
+        properties: {
+          limit: { type: 'number', description: 'Max bets to return (default 10)' },
+          status: {
+            type: 'string',
+            enum: ['ALL', 'PENDING', 'WIN', 'LOSS', 'PUSH'],
+            description: 'Filter by status',
+          },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_bankroll',
+      description: 'Get current bankroll balance, total profit, win rate, and ROI.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_navigate',
+      description:
+        'Navigate the server-controlled headless browser to a URL. Use to visit sportsbooks like DraftKings, FanDuel, PrizePicks.',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'Full URL including https://' },
+          wait_for: {
+            type: 'string',
+            enum: ['domcontentloaded', 'load', 'networkidle'],
+            description: "Page load strategy (default: 'domcontentloaded')",
+          },
+        },
+        required: ['url'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_screenshot',
+      description:
+        'Capture a screenshot of the current browser page. Returns the current URL and a visual snapshot. Use after navigating to verify page state.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_extract',
+      description:
+        'Extract text or an attribute from the current browser page using a CSS selector. Use to read odds, lines, or player props from sportsbook pages.',
+      parameters: {
+        type: 'object',
+        properties: {
+          selector: { type: 'string', description: 'CSS selector' },
+          attribute: {
+            type: 'string',
+            description: "HTML attribute to read instead of text (e.g. 'data-odds')",
+          },
+        },
+        required: ['selector'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_click',
+      description: 'Click a DOM element on the current browser page.',
+      parameters: {
+        type: 'object',
+        properties: {
+          selector: { type: 'string', description: 'CSS selector of element to click' },
+        },
+        required: ['selector'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_fill',
+      description: 'Type a value into a text input on the current browser page.',
+      parameters: {
+        type: 'object',
+        properties: {
+          selector: { type: 'string', description: 'CSS selector of the input' },
+          value: { type: 'string', description: 'Text to type' },
+        },
+        required: ['selector', 'value'],
+      },
+    },
+  },
+] as const;
+
+// ─── Dispatcher ───────────────────────────────────────────────────────────────
+
+export async function executeTool(
+  name: string,
+  args: Record<string, any>,
+): Promise<ToolResult> {
+  try {
+    switch (name) {
+      // ── Data Tools ───────────────────────────────────────────────────────
+
+      case 'sync_odds': {
+        const sport = args.sport ?? 'basketball_nba';
+        const count = await syncLiveOdds(sport);
+        return { ok: true, data: { count, sport, message: `Synced ${count} games for ${sport}` } };
+      }
+
+      case 'scan_edge': {
+        const settings = await db.settings.get(1);
+        const bankroll = settings?.bankroll ?? 1000;
+        const result = await scanForEdge(bankroll);
+        return { ok: true, data: result };
+      }
+
+      case 'calculate_kelly': {
+        const { odds, win_probability } = args;
+        const settings = await db.settings.get(1);
+        const bankroll = settings?.bankroll ?? 1000;
+        const result = kellyBreakdown(win_probability, odds, bankroll);
+        return { ok: true, data: result };
+      }
+
+      case 'get_bet_history': {
+        const limit = args.limit ?? 10;
+        const statusFilter = args.status ?? 'ALL';
+        let bets = await db.bets.orderBy('timestamp').reverse().limit(limit * 3).toArray();
+        if (statusFilter !== 'ALL') {
+          bets = bets.filter(b => b.status === statusFilter);
+        }
+        bets = bets.slice(0, limit);
+
+        const settled = bets.filter(b => b.status !== BetStatus.PENDING);
+        const wins = settled.filter(b => b.status === BetStatus.WIN).length;
+        const totalProfit = settled.reduce((s, b) => s + (b.resultProfit ?? 0), 0);
+        const totalStaked = settled.reduce((s, b) => s + b.stake, 0);
+
+        return {
+          ok: true,
+          data: {
+            bets: bets.map(b => ({
+              sport: b.sport,
+              teams: b.teams.join(' vs '),
+              betType: b.betType,
+              odds: b.odds,
+              stake: b.stake,
+              status: b.status,
+              profit: b.resultProfit ?? 0,
+              bookmaker: b.bookmaker,
+              date: new Date(b.timestamp).toLocaleDateString(),
+            })),
+            stats: {
+              count: settled.length,
+              winRate: settled.length > 0 ? ((wins / settled.length) * 100).toFixed(1) + '%' : 'N/A',
+              totalProfit: totalProfit.toFixed(2),
+              roi: totalStaked > 0 ? ((totalProfit / totalStaked) * 100).toFixed(1) + '%' : 'N/A',
+            },
+          },
+        };
+      }
+
+      case 'get_bankroll': {
+        const settings = await db.settings.get(1);
+        const bets = await db.bets.toArray();
+        const settled = bets.filter(b => b.status !== BetStatus.PENDING);
+        const wins = settled.filter(b => b.status === BetStatus.WIN);
+        const totalProfit = settled.reduce((s, b) => s + (b.resultProfit ?? 0), 0);
+        const totalStaked = settled.reduce((s, b) => s + b.stake, 0);
+        const pending = bets.filter(b => b.status === BetStatus.PENDING);
+        const pendingStake = pending.reduce((s, b) => s + b.stake, 0);
+
+        return {
+          ok: true,
+          data: {
+            bankroll: settings?.bankroll ?? 1000,
+            totalProfit: parseFloat(totalProfit.toFixed(2)),
+            balance: parseFloat(((settings?.bankroll ?? 1000) + totalProfit).toFixed(2)),
+            winRate: settled.length > 0 ? ((wins.length / settled.length) * 100).toFixed(1) + '%' : 'N/A',
+            roi: totalStaked > 0 ? ((totalProfit / totalStaked) * 100).toFixed(1) + '%' : 'N/A',
+            pendingBets: pending.length,
+            pendingStake: parseFloat(pendingStake.toFixed(2)),
+            settledBets: settled.length,
+          },
+        };
+      }
+
+      // ── Browser Tools ────────────────────────────────────────────────────
+
+      case 'browser_navigate': {
+        const res = await fetch('/api/browser/navigate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: args.url, waitFor: args.wait_for ?? 'domcontentloaded' }),
+        });
+        const json = await res.json();
+        if (!res.ok) return { ok: false, error: json.error };
+        return { ok: true, data: json, browserUrl: json.url };
+      }
+
+      case 'browser_screenshot': {
+        const res = await fetch('/api/browser/screenshot');
+        const json = await res.json();
+        if (!res.ok) return { ok: false, error: json.error };
+        return {
+          ok: true,
+          data: { url: json.url, message: `Screenshot captured at ${json.url}` },
+          screenshot: json.screenshot,
+          browserUrl: json.url,
+        };
+      }
+
+      case 'browser_extract': {
+        const res = await fetch('/api/browser/extract', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ selector: args.selector, attribute: args.attribute }),
+        });
+        const json = await res.json();
+        if (!res.ok) return { ok: false, error: json.error };
+        return { ok: true, data: { content: json.content } };
+      }
+
+      case 'browser_click': {
+        const res = await fetch('/api/browser/click', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ selector: args.selector }),
+        });
+        const json = await res.json();
+        if (!res.ok) return { ok: false, error: json.error };
+        return { ok: true, data: json };
+      }
+
+      case 'browser_fill': {
+        const res = await fetch('/api/browser/fill', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ selector: args.selector, value: args.value }),
+        });
+        const json = await res.json();
+        if (!res.ok) return { ok: false, error: json.error };
+        return { ok: true, data: json };
+      }
+
+      default:
+        return { ok: false, error: `Unknown tool: "${name}"` };
+    }
+  } catch (err: any) {
+    return { ok: false, error: err?.message ?? 'Tool execution failed' };
+  }
+}
