@@ -1,0 +1,769 @@
+import {
+  useState, useEffect, useRef, useCallback, type FormEvent,
+} from 'react';
+import {
+  Bot, Terminal, RefreshCw, Send, Loader2, Zap,
+  Eye, EyeOff, Radio, Square, ChevronDown, ChevronUp,
+  Globe, TrendingUp, AlertTriangle, CheckCircle2, X,
+  Cpu, Target, ShieldCheck
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import { cn } from '../lib/utils';
+import { syncLiveOdds } from '../services/oddsService';
+import { scanForEdge, type ScanResult, type EdgeOpportunity } from '../services/edgeScanner';
+import { executeTool, AGENT_TOOLS } from '../services/agentTools';
+import { db } from '../db/db';
+import { useLiveQuery } from 'dexie-react-hooks';
+
+// ─── System Prompt ─────────────────────────────────────────────────────────────
+
+const SYSTEM_PROMPT = `You are the Overlay Edge Neural Bridge — an autonomous sports betting analyst and browser agent.
+
+CAPABILITIES:
+- sync_odds: fetch live odds from The Odds API
+- scan_edge: compute EV+, arbitrage, Kelly stakes across all live markets
+- calculate_kelly: optimal stake sizing for a specific bet
+- get_bet_history / get_bankroll: performance context
+- browser_navigate / browser_screenshot / browser_extract / browser_click / browser_fill: control a headless Chromium instance
+
+OPERATING RULES:
+1. Always sync_odds before scan_edge to ensure fresh data.
+2. For any specific edge recommendation, include: selection, book, odds, EV%, Kelly stake in $.
+3. When using browser tools, navigate → screenshot → extract in sequence.
+4. Never recommend bet sizes exceeding 10% of bankroll regardless of Kelly output.
+5. Cite the specific bookmaker and odds in every recommendation.
+6. Format responses as plain text. Max 4 sentences unless user requests detail.`;
+
+// ─── Types ─────────────────────────────────────────────────────────────────────
+
+type EngineMode = 'deepseek' | 'windowai';
+type ViewMode = 'chat' | 'logs' | 'scanner';
+
+interface LogEntry {
+  id: string;
+  ts: string;
+  msg: string;
+  status: 'info' | 'success' | 'warn' | 'error' | 'tool';
+}
+
+interface ChatMessage {
+  id: string;
+  role: 'user' | 'agent';
+  content: string;
+  toolCalls?: { name: string; args: Record<string, any> }[];
+  screenshot?: string;
+  ts: Date;
+  processing?: boolean;
+}
+
+/** Internal message array passed to DeepSeek API */
+interface ApiMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string | null;
+  tool_calls?: any[];
+  tool_call_id?: string;
+}
+
+declare global {
+  interface Window {
+    ai?: {
+      languageModel?: {
+        capabilities: () => Promise<{ available: 'readily' | 'after-download' | 'no' }>;
+        create: (opts?: any) => Promise<{ prompt: (input: string) => Promise<string> }>;
+      };
+    };
+  }
+}
+
+const MAX_TOOL_TURNS = 10;
+
+// ─── Component ─────────────────────────────────────────────────────────────────
+
+export default function Agent() {
+  const settings = useLiveQuery(() => db.settings.get(1));
+
+  // ── Engine & View state ──────────────────────────────────────────────────
+  const [engineMode, setEngineMode] = useState<EngineMode>('deepseek');
+  const [windowAiAvailable, setWindowAiAvailable] = useState<boolean | null>(null);
+  const [viewMode, setViewMode] = useState<ViewMode>('chat');
+
+  // ── Chat state ───────────────────────────────────────────────────────────
+  const [messages, setMessages] = useState<ChatMessage[]>([{
+    id: '0',
+    role: 'agent',
+    content: 'Neural Bridge online. I have access to live odds, a full EV scanner, and a headless browser. Ask me to scan for edge, analyze a market, or navigate a sportsbook.',
+    ts: new Date(),
+  }]);
+  const [apiHistory, setApiHistory] = useState<ApiMessage[]>([]);
+  const [input, setInput] = useState('');
+  const [isRunning, setIsRunning] = useState(false);
+
+  // ── Log state ────────────────────────────────────────────────────────────
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+
+  // ── Edge scan state ──────────────────────────────────────────────────────
+  const [scanResult, setScanResult] = useState<ScanResult | null>(null);
+  const [isScanning, setIsScanning] = useState(false);
+  const [expandedOpp, setExpandedOpp] = useState<string | null>(null);
+
+  // ── Autonomous mode ──────────────────────────────────────────────────────
+  const [autonomousMode, setAutonomousMode] = useState(false);
+  const [autoInterval, setAutoInterval] = useState(5);
+  const autoTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // ── Browser live view ────────────────────────────────────────────────────
+  const [browserScreenshot, setBrowserScreenshot] = useState<string | null>(null);
+  const [browserUrl, setBrowserUrl] = useState<string | null>(null);
+  const [showBrowserPanel, setShowBrowserPanel] = useState(false);
+
+  const chatEndRef = useRef<HTMLDivElement>(null);
+
+  // ── Auto-scroll ──────────────────────────────────────────────────────────
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  // ── window.ai check ──────────────────────────────────────────────────────
+  useEffect(() => {
+    (async () => {
+      addLog('Checking browser AI capabilities...', 'info');
+      try {
+        if (window.ai?.languageModel) {
+          const caps = await window.ai.languageModel.capabilities();
+          setWindowAiAvailable(caps.available === 'readily');
+          addLog(`window.ai: ${caps.available === 'readily' ? 'Gemma Nano READY' : 'not available'}`, caps.available === 'readily' ? 'success' : 'info');
+        } else {
+          setWindowAiAvailable(false);
+          addLog('window.ai not detected — DeepSeek cloud active', 'info');
+        }
+      } catch {
+        setWindowAiAvailable(false);
+      }
+      addLog('Neural Bridge ready', 'success');
+    })();
+  }, []);
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
+
+  const addLog = useCallback((msg: string, status: LogEntry['status'] = 'info') => {
+    const now = new Date();
+    const ts = [now.getHours(), now.getMinutes(), now.getSeconds()]
+      .map(n => String(n).padStart(2, '0')).join(':');
+    setLogs(prev => [{ id: crypto.randomUUID(), ts, msg, status }, ...prev].slice(0, 200));
+  }, []);
+
+  const appendMessage = (msg: ChatMessage) => setMessages(prev => [...prev, msg]);
+  const updateMessage = (id: string, update: Partial<ChatMessage>) =>
+    setMessages(prev => prev.map(m => m.id === id ? { ...m, ...update } : m));
+
+  // ─── ReAct Tool-Call Loop ──────────────────────────────────────────────
+
+  const runAgent = useCallback(async (userText: string) => {
+    if (!userText.trim() || isRunning) return;
+    setIsRunning(true);
+
+    const userChatMsg: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: 'user',
+      content: userText,
+      ts: new Date(),
+    };
+    appendMessage(userChatMsg);
+
+    // Build API history
+    const newApiHistory: ApiMessage[] = [
+      ...apiHistory,
+      { role: 'user', content: userText },
+    ];
+
+    const agentId = crypto.randomUUID();
+    appendMessage({ id: agentId, role: 'agent', content: '', ts: new Date(), processing: true });
+
+    try {
+      // ── window.ai (Gemma Nano) path — no tool support ────────────────
+      if (engineMode === 'windowai' && windowAiAvailable && window.ai?.languageModel) {
+        addLog('Routing to Gemma Nano (no tool support)...', 'tool');
+        const session = await window.ai.languageModel.create({ systemPrompt: SYSTEM_PROMPT });
+        const ctx = newApiHistory.map(m => `${m.role}: ${m.content}`).join('\n');
+        const reply = await session.prompt(ctx);
+        updateMessage(agentId, { content: reply, processing: false });
+        setApiHistory([...newApiHistory, { role: 'assistant', content: reply }]);
+        addLog('Gemma response complete', 'success');
+        setIsRunning(false);
+        return;
+      }
+
+      // ── DeepSeek ReAct loop ──────────────────────────────────────────
+      let loopHistory = [...newApiHistory];
+      let finalContent = '';
+      let accToolCalls: ChatMessage['toolCalls'] = [];
+      let accScreenshot: string | undefined;
+
+      for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
+        addLog(`DeepSeek call — turn ${turn + 1}/${MAX_TOOL_TURNS}`, 'tool');
+
+        const response = await fetch('/api/chat/deepseek', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'deepseek-chat',
+            messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...loopHistory],
+            tools: AGENT_TOOLS,
+            tool_choice: 'auto',
+            temperature: 0.4,
+            max_tokens: 600,
+          }),
+        });
+
+        if (!response.ok) throw new Error(`DeepSeek API ${response.status}`);
+        const data = await response.json();
+        if (data.error) throw new Error(data.error);
+
+        const choice = data.choices?.[0];
+        const msg = choice?.message;
+        if (!msg) throw new Error('No message in response');
+
+        // ── No tool calls → final answer ──────────────────────────────
+        if (!msg.tool_calls?.length) {
+          finalContent = msg.content ?? '';
+          loopHistory.push({ role: 'assistant', content: finalContent });
+          addLog('Final answer received', 'success');
+          break;
+        }
+
+        // ── Execute tool calls ─────────────────────────────────────────
+        loopHistory.push({ role: 'assistant', content: msg.content ?? null, tool_calls: msg.tool_calls });
+
+        for (const tc of msg.tool_calls) {
+          const toolName: string = tc.function.name;
+          let toolArgs: Record<string, any> = {};
+          try { toolArgs = JSON.parse(tc.function.arguments ?? '{}'); } catch {}
+
+          addLog(`→ ${toolName}(${JSON.stringify(toolArgs).slice(0, 80)})`, 'tool');
+          accToolCalls!.push({ name: toolName, args: toolArgs });
+
+          const result = await executeTool(toolName, toolArgs);
+
+          // Handle browser screenshot side-effects
+          if (result.screenshot) {
+            setBrowserScreenshot(result.screenshot);
+            setShowBrowserPanel(true);
+            accScreenshot = result.screenshot;
+          }
+          if (result.browserUrl) setBrowserUrl(result.browserUrl);
+
+          // Handle edge scan side-effects
+          if (toolName === 'scan_edge' && result.ok && result.data) {
+            setScanResult(result.data);
+          }
+
+          const resultStr = result.ok
+            ? JSON.stringify(result.data).slice(0, 1500)
+            : `ERROR: ${result.error}`;
+
+          addLog(`← ${toolName}: ${result.ok ? 'OK' : 'ERR'} — ${resultStr.slice(0, 100)}`, result.ok ? 'success' : 'error');
+
+          loopHistory.push({
+            role: 'tool',
+            content: resultStr,
+            tool_call_id: tc.id,
+          });
+        }
+
+        // Update in-progress display
+        updateMessage(agentId, {
+          content: `[${accToolCalls!.map(t => t.name).join(' → ')}]`,
+          toolCalls: [...accToolCalls!],
+        });
+      }
+
+      updateMessage(agentId, {
+        content: finalContent || 'Task complete. Check the Scanner tab for results.',
+        toolCalls: accToolCalls!.length > 0 ? accToolCalls : undefined,
+        screenshot: accScreenshot,
+        processing: false,
+      });
+      setApiHistory(loopHistory);
+
+    } catch (err: any) {
+      addLog(`Agent error: ${err.message}`, 'error');
+      updateMessage(agentId, {
+        content: `Error: ${err.message}. Check DeepSeek API key in Settings → APIs.`,
+        processing: false,
+      });
+    } finally {
+      setIsRunning(false);
+    }
+  }, [isRunning, apiHistory, engineMode, windowAiAvailable, addLog]);
+
+  // ── Quick edge scan (without chat) ───────────────────────────────────────
+
+  const runManualScan = async () => {
+    setIsScanning(true);
+    addLog('Manual edge scan triggered', 'tool');
+    try {
+      const count = await syncLiveOdds('basketball_nba');
+      addLog(`Synced ${count} NBA games`, 'success');
+      const results = await scanForEdge(settings?.bankroll ?? 1000);
+      setScanResult(results);
+      setViewMode('scanner');
+      addLog(results.summary, results.topEdge ? 'success' : 'info');
+    } catch (err: any) {
+      addLog(`Scan failed: ${err.message}`, 'error');
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  // ── Autonomous mode ──────────────────────────────────────────────────────
+
+  const runAutoCycle = useCallback(async () => {
+    addLog('⏰ Autonomous cycle starting...', 'tool');
+    try {
+      const count = await syncLiveOdds('basketball_nba');
+      const results = await scanForEdge(settings?.bankroll ?? 1000);
+      setScanResult(results);
+      addLog(`Auto-scan: ${results.marketsScanned}m, ${results.edgeOpportunities.length} EV+ opps`, 'info');
+
+      if (results.topEdge && results.topEdge.ev >= 0.04) {
+        const e = results.topEdge;
+        const alertMsg = `⚡ AUTO-SCAN ALERT: ${e.grade}-grade edge — ${e.selection} @ ${e.bookmaker} · ${e.odds.toFixed(2)} odds · ${(e.ev * 100).toFixed(1)}% EV · Kelly: $${e.kellyStake.toFixed(2)}`;
+        addLog(alertMsg, 'success');
+        appendMessage({
+          id: crypto.randomUUID(),
+          role: 'agent',
+          content: alertMsg,
+          ts: new Date(),
+        });
+      }
+      if (results.topArb) {
+        addLog(`🎯 ARB: ${results.topArb.roi.toFixed(2)}% ROI — ${results.topArb.homeTeam} vs ${results.topArb.awayTeam}`, 'success');
+      }
+    } catch (err: any) {
+      addLog(`Auto-cycle error: ${err.message}`, 'error');
+    }
+  }, [settings, addLog]);
+
+  const toggleAutoMode = () => {
+    if (autonomousMode) {
+      if (autoTimerRef.current) clearInterval(autoTimerRef.current);
+      autoTimerRef.current = null;
+      setAutonomousMode(false);
+      addLog('Autonomous mode stopped', 'info');
+    } else {
+      runAutoCycle();
+      autoTimerRef.current = setInterval(runAutoCycle, autoInterval * 60 * 1000);
+      setAutonomousMode(true);
+      addLog(`Autonomous mode active — cycling every ${autoInterval}m`, 'success');
+    }
+  };
+
+  useEffect(() => () => { if (autoTimerRef.current) clearInterval(autoTimerRef.current); }, []);
+
+  // ─── Render ───────────────────────────────────────────────────────────────
+
+  return (
+    <div className="flex flex-col h-[calc(100vh-8rem)] pb-20 px-2 gap-3">
+
+      {/* ── Header ─────────────────────────────────────────────────────── */}
+      <header className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight text-white">NEURAL BRIDGE</h1>
+          <p className="text-gray-400 text-[10px] uppercase tracking-widest font-mono">
+            ReAct · {AGENT_TOOLS.length} Tools · {messages.length} ctx
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          {/* Autonomous mode */}
+          <button
+            onClick={toggleAutoMode}
+            className={cn(
+              'flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-[10px] font-bold uppercase transition-all',
+              autonomousMode
+                ? 'bg-green-500/15 border-green-500/40 text-green-400 animate-pulse'
+                : 'bg-white/5 border-white/5 text-gray-500 hover:text-gray-300',
+            )}
+          >
+            <Radio className="w-3 h-3" />
+            {autonomousMode ? `AUTO ${autoInterval}m` : 'AUTO'}
+          </button>
+          <button
+            onClick={() => { setMessages([{ id: '0', role: 'agent', content: 'Cleared.', ts: new Date() }]); setApiHistory([]); }}
+            className="text-[9px] text-gray-600 hover:text-gray-400 font-bold uppercase"
+          >
+            CLR
+          </button>
+        </div>
+      </header>
+
+      {/* ── Controls row ────────────────────────────────────────────────── */}
+      <div className="flex items-center gap-2 flex-wrap">
+        {/* Engine toggle */}
+        <div className="flex bg-white/5 p-0.5 rounded-lg border border-white/5">
+          {(['deepseek', 'windowai'] as EngineMode[]).map(e => (
+            <button
+              key={e}
+              onClick={() => setEngineMode(e)}
+              disabled={e === 'windowai' && !windowAiAvailable}
+              className={cn(
+                'px-2.5 py-1.5 text-[10px] font-bold rounded-md transition-all uppercase',
+                engineMode === e ? 'bg-brand-secondary text-white' : 'text-gray-500',
+                e === 'windowai' && !windowAiAvailable && 'opacity-30 cursor-not-allowed',
+              )}
+            >
+              {e === 'deepseek' ? 'DSK-R1' : 'GEMMA'}
+            </button>
+          ))}
+        </div>
+
+        {/* View toggle */}
+        <div className="flex bg-white/5 p-0.5 rounded-lg border border-white/5">
+          {(['chat', 'logs', 'scanner'] as ViewMode[]).map(v => (
+            <button
+              key={v}
+              onClick={() => setViewMode(v)}
+              className={cn(
+                'px-2.5 py-1.5 text-[10px] font-bold rounded-md transition-all uppercase',
+                viewMode === v ? 'bg-brand-primary text-white' : 'text-gray-500',
+              )}
+            >
+              {v}
+            </button>
+          ))}
+        </div>
+
+        <div className="flex gap-1.5 ml-auto">
+          {/* Quick scan */}
+          <button
+            onClick={runManualScan}
+            disabled={isScanning}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-brand-primary/10 border border-brand-primary/30 text-brand-primary rounded-xl text-[10px] font-bold uppercase hover:bg-brand-primary/20 transition-all"
+          >
+            <Target className={cn('w-3 h-3', isScanning && 'animate-spin')} />
+            {isScanning ? 'SCANNING' : 'SCAN EDGE'}
+          </button>
+          {/* Browser panel toggle */}
+          <button
+            onClick={() => setShowBrowserPanel(v => !v)}
+            className={cn(
+              'p-2 rounded-xl border transition-all',
+              showBrowserPanel
+                ? 'bg-brand-secondary/10 border-brand-secondary/30 text-brand-secondary'
+                : 'bg-white/5 border-white/5 text-gray-500',
+            )}
+          >
+            <Globe className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+
+      {/* ── Browser live-view panel ─────────────────────────────────────── */}
+      <AnimatePresence>
+        {showBrowserPanel && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+            className="overflow-hidden"
+          >
+            <div className="glass-panel p-3 border-brand-secondary/20">
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-2">
+                  <Globe className="w-3 h-3 text-brand-secondary" />
+                  <span className="text-[10px] font-bold text-brand-secondary uppercase">Browser Control</span>
+                  {browserUrl && (
+                    <span className="text-[9px] font-mono text-gray-500 truncate max-w-[200px]">{browserUrl}</span>
+                  )}
+                </div>
+                <button onClick={() => setShowBrowserPanel(false)}>
+                  <X className="w-3.5 h-3.5 text-gray-600" />
+                </button>
+              </div>
+              {browserScreenshot ? (
+                <img
+                  src={`data:image/jpeg;base64,${browserScreenshot}`}
+                  alt="Browser screenshot"
+                  className="w-full rounded-xl border border-white/5 object-cover"
+                  style={{ maxHeight: 200 }}
+                />
+              ) : (
+                <div className="h-20 flex items-center justify-center text-[10px] text-gray-600 font-mono italic">
+                  No screenshot yet — agent must call browser_navigate then browser_screenshot
+                </div>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Main content area ───────────────────────────────────────────── */}
+      <div className="flex-1 overflow-y-auto glass-panel p-3 min-h-0">
+
+        {/* CHAT VIEW */}
+        {viewMode === 'chat' && (
+          <div className="space-y-3">
+            {messages.map(msg => (
+              <div key={msg.id} className={cn('flex', msg.role === 'user' ? 'justify-end' : 'justify-start')}>
+                <div className={cn(
+                  'max-w-[88%] p-3 rounded-2xl text-[11px] leading-relaxed',
+                  msg.role === 'user'
+                    ? 'bg-brand-primary/20 border border-brand-primary/30 text-white'
+                    : 'bg-white/5 border border-white/5 text-gray-200',
+                )}>
+                  {msg.role === 'agent' && (
+                    <div className="flex items-center gap-1.5 mb-1.5">
+                      <Bot className="w-3 h-3 text-brand-secondary" />
+                      <span className="text-[9px] font-bold text-brand-secondary uppercase">Neural Bridge</span>
+                      {msg.processing && <Loader2 className="w-2.5 h-2.5 animate-spin text-brand-primary" />}
+                    </div>
+                  )}
+                  {/* Tool call badges */}
+                  {msg.toolCalls && msg.toolCalls.length > 0 && (
+                    <div className="flex flex-wrap gap-1 mb-1.5">
+                      {msg.toolCalls.map((tc, i) => (
+                        <span key={i} className="text-[9px] font-mono bg-brand-secondary/10 text-brand-secondary border border-brand-secondary/20 px-1.5 py-0.5 rounded-full">
+                          {tc.name}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {msg.content}
+                  {/* Inline screenshot thumbnail */}
+                  {msg.screenshot && (
+                    <img
+                      src={`data:image/jpeg;base64,${msg.screenshot}`}
+                      alt="screenshot"
+                      className="mt-2 w-full rounded-lg border border-white/10"
+                      style={{ maxHeight: 120, objectFit: 'cover' }}
+                    />
+                  )}
+                </div>
+              </div>
+            ))}
+            <div ref={chatEndRef} />
+          </div>
+        )}
+
+        {/* LOGS VIEW */}
+        {viewMode === 'logs' && (
+          <div className="font-mono text-[9px] space-y-0.5">
+            {logs.length === 0 && <p className="text-gray-600 italic">No log entries yet.</p>}
+            {logs.map(log => (
+              <div key={log.id} className={cn('flex gap-2',
+                log.status === 'success' ? 'text-green-400' :
+                log.status === 'error'   ? 'text-red-400' :
+                log.status === 'warn'    ? 'text-yellow-400' :
+                log.status === 'tool'    ? 'text-brand-secondary' : 'text-gray-500',
+              )}>
+                <span className="text-gray-700 shrink-0">[{log.ts}]</span>
+                <span className="break-all">{log.msg}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* SCANNER VIEW */}
+        {viewMode === 'scanner' && (
+          <div className="space-y-4">
+            {!scanResult ? (
+              <div className="flex flex-col items-center justify-center py-12 text-center">
+                <Target className="w-8 h-8 text-gray-600 mb-3" />
+                <p className="text-[11px] text-gray-500 font-mono">No scan results yet.</p>
+                <p className="text-[10px] text-gray-600 mt-1">Press SCAN EDGE or ask the agent to "scan for edge".</p>
+              </div>
+            ) : (
+              <>
+                {/* Scan meta */}
+                <div className="flex items-center justify-between text-[10px] font-mono text-gray-500">
+                  <span>
+                    {scanResult.marketsScanned}m · {scanResult.bookmakersCovered} books · {scanResult.edgeOpportunities.length} EV+
+                  </span>
+                  <span>{new Date(scanResult.scannedAt).toLocaleTimeString()}</span>
+                </div>
+
+                {/* Arbitrage banner */}
+                {scanResult.arbitrageOpportunities.length > 0 && (
+                  <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-xl">
+                    <div className="flex items-center gap-2 mb-2">
+                      <AlertTriangle className="w-4 h-4 text-yellow-400" />
+                      <span className="text-[11px] font-bold text-yellow-400 uppercase">
+                        Arbitrage Detected — {scanResult.arbitrageOpportunities.length} opportunity
+                      </span>
+                    </div>
+                    {scanResult.arbitrageOpportunities.slice(0, 2).map((arb, i) => (
+                      <div key={i} className="mt-2 p-2 bg-black/20 rounded-lg">
+                        <p className="text-[10px] font-bold text-white">
+                          {arb.awayTeam} @ {arb.homeTeam} — {arb.roi.toFixed(2)}% ROI
+                        </p>
+                        {arb.legs.map((leg, j) => (
+                          <p key={j} className="text-[9px] font-mono text-gray-400">
+                            {leg.selection} @ {leg.bookmaker} · {leg.odds.toFixed(2)} · {(leg.stakePct * 100).toFixed(1)}% stake
+                          </p>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* EV Opportunities */}
+                {scanResult.edgeOpportunities.length === 0 ? (
+                  <p className="text-center text-[10px] text-gray-600 font-mono italic py-4">
+                    No EV+ opportunities above 2% threshold in current markets.
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {scanResult.edgeOpportunities.map(opp => (
+                      <EdgeCard
+                        key={opp.id}
+                        opp={opp}
+                        expanded={expandedOpp === opp.id}
+                        onToggle={() => setExpandedOpp(v => v === opp.id ? null : opp.id)}
+                        onAsk={q => { setInput(q); setViewMode('chat'); }}
+                      />
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* ── Input ──────────────────────────────────────────────────────── */}
+      {viewMode === 'chat' && (
+        <form
+          onSubmit={(e: FormEvent) => { e.preventDefault(); const v = input.trim(); if (v) { setInput(''); runAgent(v); } }}
+          className="relative"
+        >
+          <input
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            disabled={isRunning}
+            placeholder="Ask agent… 'sync NBA odds and find the best EV bet'"
+            className="w-full bg-bg-surface p-3 pr-16 rounded-xl text-xs font-mono border border-white/5 outline-none focus:border-brand-primary disabled:opacity-50"
+          />
+          <button
+            type="submit"
+            disabled={isRunning || !input.trim()}
+            className="absolute right-2 top-1/2 -translate-y-1/2 p-2 bg-brand-primary rounded-lg disabled:opacity-30 transition-opacity"
+          >
+            {isRunning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+          </button>
+        </form>
+      )}
+
+      {/* ── Footer status ───────────────────────────────────────────────── */}
+      <div className="flex items-center justify-between px-1">
+        <span className="text-[9px] font-mono text-gray-600">
+          {engineMode === 'deepseek' ? 'DeepSeek-R1 · Tool-calling ReAct' : 'Gemma Nano · Local'}
+        </span>
+        <span className="text-[9px] font-mono text-gray-600">
+          {autonomousMode
+            ? <span className="text-green-500 animate-pulse">● AUTO every {autoInterval}m</span>
+            : 'autonomous off'}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// ─── Edge Card Sub-Component ──────────────────────────────────────────────────
+
+function EdgeCard({
+  opp,
+  expanded,
+  onToggle,
+  onAsk,
+}: {
+  opp: EdgeOpportunity;
+  expanded: boolean;
+  onToggle: () => void;
+  onAsk: (q: string) => void;
+}) {
+  const gradeColor = {
+    S: 'text-yellow-400 border-yellow-400/30 bg-yellow-400/10',
+    A: 'text-green-400 border-green-400/30 bg-green-400/10',
+    B: 'text-brand-primary border-brand-primary/30 bg-brand-primary/10',
+    C: 'text-gray-400 border-gray-400/30 bg-gray-400/10',
+  }[opp.grade];
+
+  return (
+    <div className={cn(
+      'rounded-xl border transition-all',
+      expanded ? 'border-brand-primary/30 bg-brand-primary/5' : 'border-white/5 bg-black/20',
+    )}>
+      <button className="w-full p-3 flex items-center justify-between" onClick={onToggle}>
+        <div className="flex items-center gap-2 text-left min-w-0">
+          <span className={cn('text-[10px] font-bold px-1.5 py-0.5 rounded-full border shrink-0', gradeColor)}>
+            {opp.grade}
+          </span>
+          <div className="min-w-0">
+            <p className="text-[11px] font-semibold text-white truncate">{opp.selection}</p>
+            <p className="text-[9px] text-gray-500 font-mono">{opp.awayTeam} @ {opp.homeTeam}</p>
+          </div>
+        </div>
+        <div className="flex items-center gap-3 shrink-0">
+          <div className="text-right">
+            <p className="text-[11px] font-bold text-brand-secondary">{(opp.ev * 100).toFixed(1)}% EV</p>
+            <p className="text-[9px] text-gray-500 font-mono">@ {opp.odds.toFixed(2)}</p>
+          </div>
+          {expanded ? <ChevronUp className="w-3.5 h-3.5 text-gray-500" /> : <ChevronDown className="w-3.5 h-3.5 text-gray-500" />}
+        </div>
+      </button>
+
+      <AnimatePresence>
+        {expanded && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+            className="overflow-hidden"
+          >
+            <div className="px-3 pb-3 space-y-3 border-t border-white/5 pt-3">
+              <div className="grid grid-cols-2 gap-2 text-[10px] font-mono">
+                <div className="bg-black/20 p-2 rounded-lg">
+                  <p className="text-gray-500">Book</p>
+                  <p className="text-white font-bold">{opp.bookmaker}</p>
+                </div>
+                <div className="bg-black/20 p-2 rounded-lg">
+                  <p className="text-gray-500">Kelly Stake</p>
+                  <p className="text-white font-bold">${opp.kellyStake.toFixed(2)}</p>
+                </div>
+                <div className="bg-black/20 p-2 rounded-lg">
+                  <p className="text-gray-500">No-Vig Prob</p>
+                  <p className="text-white font-bold">{(opp.noVigProb * 100).toFixed(1)}%</p>
+                </div>
+                <div className="bg-black/20 p-2 rounded-lg">
+                  <p className="text-gray-500">Book Implied</p>
+                  <p className="text-white font-bold">{(opp.impliedProb * 100).toFixed(1)}%</p>
+                </div>
+                <div className="bg-black/20 p-2 rounded-lg">
+                  <p className="text-gray-500">Books Compared</p>
+                  <p className="text-white font-bold">{opp.bookCount}</p>
+                </div>
+                <div className="bg-black/20 p-2 rounded-lg">
+                  <p className="text-gray-500">Quarter-Kelly %</p>
+                  <p className="text-white font-bold">{(opp.kellyPct * 100).toFixed(2)}%</p>
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => onAsk(`Analyze the ${opp.selection} bet at ${opp.bookmaker} (${opp.odds.toFixed(2)} odds, ${(opp.ev * 100).toFixed(1)}% EV). Should I take it? What are the risks?`)}
+                  className="flex-1 py-2 bg-brand-primary/10 border border-brand-primary/20 text-brand-primary text-[10px] font-bold rounded-lg hover:bg-brand-primary/20 transition-colors"
+                >
+                  Deep Analysis
+                </button>
+                <button
+                  onClick={() => onAsk(`Navigate to ${opp.bookmaker}'s website and verify the ${opp.selection} odds are still ${opp.odds.toFixed(2)}.`)}
+                  className="flex-1 py-2 bg-brand-secondary/10 border border-brand-secondary/20 text-brand-secondary text-[10px] font-bold rounded-lg hover:bg-brand-secondary/20 transition-colors"
+                >
+                  Verify Live
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
